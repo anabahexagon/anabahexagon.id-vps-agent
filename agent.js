@@ -3,6 +3,7 @@ const { io } = require('socket.io-client');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const si = require('systeminformation');
 
 const HELPER_URL = process.env.HELPER_URL || 'http://localhost:3005';
 const SERVER_ID = process.env.SERVER_ID;
@@ -14,13 +15,15 @@ if (!SERVER_ID || !AGENT_TOKEN) {
 }
 
 const socket = io(`${HELPER_URL}/agent`, {
-  auth: { token: AGENT_TOKEN, serverId: SERVER_ID }
+  auth: { token: AGENT_TOKEN, serverId: SERVER_ID },
+  reconnection: true
 });
 
-console.log(`Connecting to ${HELPER_URL}/agent...`);
+console.log(`[${new Date().toISOString()}] Connecting to ${HELPER_URL}/agent...`);
 
 socket.on('connect', () => {
   console.log('Successfully connected to Helper');
+  startMetricsCollection();
 });
 
 socket.on('connect_error', (err) => {
@@ -28,51 +31,160 @@ socket.on('connect_error', (err) => {
 });
 
 socket.on('deploy-task', (data, callback) => {
-  const { deployPath, buildScript, branch } = data;
-  console.log(`Received deployment task for branch: ${branch} in ${deployPath}`);
+  const { deployPath, buildScript, branch, deploymentId, repoUrl } = data;
+  
+  console.log(`\n[${new Date().toISOString()}] >>> TASK RECEIVED (ID: ${deploymentId})`);
+  console.log(`- Repo: ${repoUrl}`);
+  console.log(`- Branch: ${branch}`);
+  console.log(`- Path: ${deployPath}`);
 
-  if (!fs.existsSync(deployPath)) {
-    return callback({ success: false, error: `Deploy path does not exist: ${deployPath}` });
+  if (typeof callback === 'function') {
+    callback({ success: true });
   }
 
-  // Akui tugas diterima
-  callback({ success: true });
-
-  const runCommand = (cmd, args, cwd) => {
+  let allLogs = "";
+  
+  const runCommand = (cmd, args, cwd, timeoutMs = 600000) => {
     return new Promise((resolve, reject) => {
-      const proc = spawn(cmd, args, { cwd, shell: true });
-      proc.stdout.on('data', (d) => socket.emit('deploy-log', { serverId: SERVER_ID, data: d.toString() }));
-      proc.stderr.on('data', (d) => socket.emit('deploy-log', { serverId: SERVER_ID, data: d.toString(), isError: true }));
-      proc.on('close', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`Command failed with exit code ${code}: ${cmd} ${args.join(' ')}`));
-      });
+      const fullCommand = args.length > 0 ? `${cmd} ${args.join(' ')}` : cmd;
+      console.log(`[EXEC]: ${fullCommand}`);
+      
+      try {
+        const proc = spawn(fullCommand, [], { 
+          cwd, 
+          shell: true,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } 
+        });
+        
+        const timer = setTimeout(() => {
+          console.log(`[TIMEOUT]: ${fullCommand}`);
+          proc.kill();
+          reject(new Error(`Command timed out after ${timeoutMs/1000}s: ${fullCommand}`));
+        }, timeoutMs);
+
+        proc.stdout.on('data', (d) => {
+          const str = d.toString();
+          allLogs += str;
+          process.stdout.write(str);
+          socket.emit('deploy-log', { serverId: SERVER_ID, data: str });
+        });
+
+        proc.stderr.on('data', (d) => {
+          const str = d.toString();
+          allLogs += str;
+          process.stderr.write(str);
+          socket.emit('deploy-log', { serverId: SERVER_ID, data: str, isError: true });
+        });
+
+        proc.on('error', (err) => {
+          console.error(`[SPAWN ERROR]: ${err.message}`);
+          clearTimeout(timer);
+          reject(err);
+        });
+
+        proc.on('close', (code) => {
+          clearTimeout(timer);
+          if (code === 0) {
+            console.log(`[DONE]: ${fullCommand}`);
+            resolve();
+          } else {
+            console.log(`[FAILED]: ${fullCommand} (Exit code: ${code})`);
+            reject(new Error(`Command failed with exit code ${code}`));
+          }
+        });
+      } catch (e) {
+        console.error(`[INTERNAL ERROR]: ${e.message}`);
+        reject(e);
+      }
     });
   };
 
   const startDeploy = async () => {
     try {
-      socket.emit('deploy-log', { serverId: SERVER_ID, data: `\n--- START DEPLOYMENT: Branch ${branch} ---\n` });
+      console.log("Starting deployment process...");
+      const startMsg = `\n--- START DEPLOYMENT (ID: ${deploymentId}) ---\n`;
+      allLogs += startMsg;
+      socket.emit('deploy-log', { serverId: SERVER_ID, data: startMsg });
 
-      // 1. Pull Code
-      socket.emit('deploy-log', { serverId: SERVER_ID, data: `Step 1/2: Pulling code from origin/${branch}...\n` });
-      await runCommand('git', ['pull', 'origin', branch], deployPath);
+      if (!fs.existsSync(deployPath)) {
+        console.log(`Path doesn't exist, creating: ${deployPath}`);
+        fs.mkdirSync(deployPath, { recursive: true });
+      }
 
-      // 2. Build & Deploy
+      const isGitRepo = fs.existsSync(path.join(deployPath, '.git'));
+      if (!isGitRepo) {
+        console.log("Not a git repo, cloning...");
+        const cloneUrl = `https://github.com/${repoUrl}.git`;
+        await runCommand(`git clone -b ${branch} ${cloneUrl} .`, [], deployPath);
+      } else {
+        console.log("Existing repo found, pulling...");
+        await runCommand('git', ['fetch', 'origin', branch], deployPath);
+        await runCommand('git', ['reset', '--hard', `origin/${branch}`], deployPath);
+      }
+
       if (buildScript) {
-        socket.emit('deploy-log', { serverId: SERVER_ID, data: `Step 2/2: Executing build script...\n` });
+        console.log("Running build script...");
         const scriptLines = buildScript.split('\n').filter(l => l.trim());
         for (const line of scriptLines) {
            await runCommand(line, [], deployPath);
         }
       }
 
-      socket.emit('deploy-log', { serverId: SERVER_ID, data: `\n--- DEPLOYMENT SUCCESSFUL ---\n` });
+      console.log("Deployment finished successfully!");
+      const successMsg = `\n--- DEPLOYMENT SUCCESSFUL ---\n`;
+      allLogs += successMsg;
+      socket.emit('deploy-log', { serverId: SERVER_ID, data: successMsg });
+
+      if (deploymentId) {
+        socket.emit('deploy-result', { deploymentId, status: 'success', logs: allLogs });
+      }
     } catch (error) {
-      console.error('Deployment failed:', error);
-      socket.emit('deploy-log', { serverId: SERVER_ID, data: `\n--- DEPLOYMENT FAILED: ${error.message} ---\n`, isError: true });
+      console.error('CRITICAL DEPLOYMENT FAILURE:', error);
+      const failMsg = `\n--- DEPLOYMENT FAILED: ${error.message} ---\n`;
+      allLogs += failMsg;
+      socket.emit('deploy-log', { serverId: SERVER_ID, data: failMsg, isError: true });
+
+      if (deploymentId) {
+        socket.emit('deploy-result', { deploymentId, status: 'failed', logs: allLogs });
+      }
     }
   };
 
-  startDeploy();
+  startDeploy().catch(err => console.error("Global startDeploy error:", err));
 });
+
+let metricsInterval;
+function startMetricsCollection() {
+  console.log("Starting metrics collection...");
+  if (metricsInterval) clearInterval(metricsInterval);
+  
+  metricsInterval = setInterval(async () => {
+    try {
+      const [cpu, mem, fsSize] = await Promise.all([
+        si.currentLoad(),
+        si.mem(),
+        si.fsSize()
+      ]);
+
+      const metrics = {
+        serverId: SERVER_ID,
+        cpu: cpu.currentLoad.toFixed(1),
+        ram: {
+          used: (mem.active / 1024 / 1024 / 1024).toFixed(2),
+          total: (mem.total / 1024 / 1024 / 1024).toFixed(2),
+          percent: ((mem.active / mem.total) * 100).toFixed(1)
+        },
+        disk: fsSize.length > 0 ? {
+          used: (fsSize[0].used / 1024 / 1024 / 1024).toFixed(2),
+          total: (fsSize[0].size / 1024 / 1024 / 1024).toFixed(2),
+          percent: fsSize[0].use.toFixed(1)
+        } : null,
+        uptime: si.time().uptime
+      };
+
+      socket.emit('agent-metrics', metrics);
+    } catch (err) {
+      console.error("Failed to collect metrics:", err.message);
+    }
+  }, 5000);
+}
