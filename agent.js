@@ -58,7 +58,12 @@ socket.on('deploy-task', (data, callback) => {
         
         const timer = setTimeout(() => {
           console.log(`[TIMEOUT]: ${fullCommand}`);
-          proc.kill();
+          if (process.platform === 'win32') {
+             // Paksa matikan seluruh pohon proses di Windows jika timeout
+             spawn('taskkill', ['/F', '/T', '/PID', proc.pid]);
+          } else {
+             proc.kill('SIGKILL');
+          }
           reject(new Error(`Command timed out after ${timeoutMs/1000}s: ${fullCommand}`));
         }, timeoutMs);
 
@@ -115,7 +120,7 @@ socket.on('deploy-task', (data, callback) => {
       if (!isGitRepo) {
         console.log("Not a git repo, cloning...");
         const cloneUrl = `https://github.com/${repoUrl}.git`;
-        await runCommand(`git clone -b ${branch} ${cloneUrl} .`, [], deployPath);
+        await runCommand('git', ['clone', '-b', branch, cloneUrl, '.'], deployPath);
       } else {
         console.log("Existing repo found, pulling...");
         await runCommand('git', ['fetch', 'origin', branch], deployPath);
@@ -126,7 +131,7 @@ socket.on('deploy-task', (data, callback) => {
         console.log("Running build script...");
         const scriptLines = buildScript.split('\n').filter(l => l.trim());
         for (const line of scriptLines) {
-           await runCommand(line, [], deployPath);
+           await runCommand(line.trim(), [], deployPath);
         }
       }
 
