@@ -140,6 +140,9 @@ socket.on('deploy-task', (data, callback) => {
       allLogs += successMsg;
       socket.emit('deploy-log', { serverId: SERVER_ID, data: successMsg });
 
+      // Save to local file
+      saveLogToFile(deploymentId, allLogs);
+
       if (deploymentId) {
         socket.emit('deploy-result', { deploymentId, status: 'success', logs: allLogs });
       }
@@ -149,9 +152,24 @@ socket.on('deploy-task', (data, callback) => {
       allLogs += failMsg;
       socket.emit('deploy-log', { serverId: SERVER_ID, data: failMsg, isError: true });
 
+      // Save to local file even on failure
+      saveLogToFile(deploymentId, allLogs);
+
       if (deploymentId) {
         socket.emit('deploy-result', { deploymentId, status: 'failed', logs: allLogs });
       }
+    }
+  };
+
+  const saveLogToFile = (id, content) => {
+    try {
+      const logDir = path.join(__dirname, 'logs');
+      if (!fs.existsSync(logDir)) fs.mkdirSync(logDir);
+      const fileName = `deploy-${id || 'unknown'}-${Date.now()}.log`;
+      fs.writeFileSync(path.join(logDir, fileName), content);
+      console.log(`[LOG SAVED]: ${fileName}`);
+    } catch (err) {
+      console.error('Failed to save log to file:', err.message);
     }
   };
 
