@@ -71,14 +71,14 @@ socket.on('deploy-task', (data, callback) => {
           const str = d.toString();
           allLogs += str;
           process.stdout.write(str);
-          socket.emit('deploy-log', { serverId: SERVER_ID, data: str });
+          socket.emit('deploy-log', { serverId: SERVER_ID, deploymentId, data: str });
         });
 
         proc.stderr.on('data', (d) => {
           const str = d.toString();
           allLogs += str;
           process.stderr.write(str);
-          socket.emit('deploy-log', { serverId: SERVER_ID, data: str, isError: true });
+          socket.emit('deploy-log', { serverId: SERVER_ID, deploymentId, data: str, isError: true });
         });
 
         proc.on('error', (err) => {
